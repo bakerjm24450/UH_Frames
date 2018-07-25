@@ -1,3 +1,11 @@
+// For the cabinet with the hidden doors -- system includes ESP8266 and two relays to
+// open the hidden doors. The ESP8266 runs an MQTT broker and processes MQTT messages
+// from two picture frames. When both frames signal, the doors are unlocked.
+//
+// Used libraries from https://github.com/martin-ger/uMQTTBroker
+// Revision history:
+//  1.0 (7/25/2018) -- initial version
+
 #include <ESP8266WiFi.h>
 
 const char ssid[] = "UH_Jefferson_1";
