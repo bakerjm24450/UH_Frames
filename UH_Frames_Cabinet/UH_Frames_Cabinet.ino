@@ -392,6 +392,12 @@ void handleDoor() {
   // open the doors
   openDoor(true);
 
+  // wait a bit
+  delay(1000);
+
+  // now close them again
+  openDoor(false);
+
   // send them back to the status web page
   server.sendHeader("Location", "/");     
   server.send(303);                       

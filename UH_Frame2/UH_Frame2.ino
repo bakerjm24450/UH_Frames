@@ -11,7 +11,7 @@
 
 //#define MQTT_DEBUG_ON 1   // un-comment to turn on debug msgs for mqtt cliet
 //#define DEBUG 1           // debug msgs for pn532
-//#define FRAME_DEBUG 1     // debug msgs for the frame
+#define FRAME_DEBUG 1     // debug msgs for the frame
 
 #include <Wire.h>
 #include <ESP8266WiFi.h>
