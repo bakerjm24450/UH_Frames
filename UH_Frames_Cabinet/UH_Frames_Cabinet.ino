@@ -1,37 +1,39 @@
 // For the cabinet with the hidden doors -- system includes ESP8266 and two relays to
 // open the hidden doors. The ESP8266 runs an MQTT broker and processes MQTT messages
-// from two picture frames. When both frames signal, the doors are unlocked.
+// from the picture frames. The frames send the RFID tags that they detect, and
+// when we determine that the right frames are hanging over the right tags, we
+// open the cabinet doors.
 //
 // Used libraries from https://github.com/martin-ger/uMQTTBroker
 // Revision history:
 //  1.0 (8/7/2018) -- initial version
+//  2.0 (9/1/2018) --  revised to allow configuration -- which frame and which tag
 
 #include <ESP8266WiFi.h>
 #include <uMQTTBroker.h>
 #include <ESP8266mDNS.h>
 #include <ESP8266WebServer.h>   // Include the WebServer library
 #include <ArduinoOTA.h>
+#include <EEPROM.h>
 
 // Relay controls
-#define OFF 1             // relays are active low
-#define ON 0
+const int OFF = 1;             // relays are active low
+const int ON = 0;
+
+const int LED = 0;            // pin for the onboard LED
 
 // Pins controlling the cabinet doors
-#define DOOR1 12
-#define DOOR2 13
-
-// Whether doors are open or locked
-#define LOCKED false
-#define OPEN true
+const int DOOR1 = 12;
+const int DOOR2 = 13;
 
 // Soft AP config
-const char ssid[] = "UH_Jefferson_1";
-const char passwd[] = "&G%$bmIX^64Tx$dc2dPSQ3r@";
+const char ssid[] = "";
+const char passwd[] = "";
 const int ap_channel = 2;
 
 // OTA config
 const char OTAName[] = "UH_Jefferson_Cabinet";         // A name and a password for the OTA service
-const char OTAPassword[] = "3Z@isoBD8i&47Bc3p9JxSR$M";
+const char OTAPassword[] = "";
 
 // standard MQTT setup
 const unsigned int mqttPort = 1883;
@@ -42,18 +44,30 @@ const unsigned int maxRetainedTopics = 30;
 const char localName[] = "uh_jefferson_cabinet";      // name will be uh_jefferson_cabinet.local
 
 // web server on port 80
-ESP8266WebServer server(80); 
+ESP8266WebServer server(80);
 
-// status of each picture frame (on or off)
-bool frame1Status = false;
-bool frame2Status = false;
+// RFID tags we're looking for
+uint32_t tags[2] = {0xced29ab2, 0xbd97730f};
 
-// time of last update from each picture frame
-unsigned long frame1UpdateTime = 0;
-unsigned long frame2UpdateTime = 0;
+const int numFrames = 3;          // number of frames, including spares
+const int requiredMatches = 2;    // number of matching frames to open doors
+
+// State of a frame
+typedef enum {NO_TAG, TAG_PRESENT, NOT_RESPONDING} FrameStatus;
+
+// data structure to represent a frame
+typedef struct {
+  FrameStatus status;         // is tag present, missing, or is frame not responding?
+  uint32_t    detectedTag;    // tag this frame sees (0 if not tag present)
+  uint32_t    desiredTag;     // tag this frame is looking for (0 if frame is not used)
+  uint32_t    lastUpdateTime;  // last time we heard from this frame (in seconds)
+} Frame;
+
+// Array of frames in system
+Frame frames[numFrames];
 
 // status of the doors
-bool doorStatus = LOCKED;
+bool doorsOpen = false;
 
 // system status
 bool apStatus = false;
@@ -70,16 +84,19 @@ bool setupMdns();                         // MDNS server
 bool setupMqttBroker();                   // server for MQTT traffic
 bool setupWebServer();
 bool setupOTA();                          // Over The Air software updates
+bool setupFrames();                       // initialize the frame data structures
 
-void openDoor(bool openCmd);              // open or close the doors
+void openDoor();                          // open the doors
 
 // handle MQTT message
-void frameStatusCallback(uint32_t *client, const char* topic, uint32_t topicLen,
-                         const char *data, uint32_t dataLen);
+void frameCallback(uint32_t *client, const char* topic, uint32_t topicLen,
+                   const char *data, uint32_t dataLen);
 
-// HTTP handlers                       
+// HTTP handlers
 void handleStatusRequest();
-void handleDoor();
+void handleDoorCmd();
+void handleConfigRequest();
+void handleConfig();
 void handleRestartRequest();
 void handleNotFound();
 
@@ -90,12 +107,16 @@ void handleNotFound();
 //********************************************************************************
 void setup()
 {
+  pinMode(LED, OUTPUT);
+
   // digital outs for the doors
   pinMode(DOOR1, OUTPUT);
   pinMode(DOOR2, OUTPUT);
 
   // lock the doors
-  openDoor(false);
+  digitalWrite(DOOR1, OFF);
+  digitalWrite(DOOR2, OFF);
+  digitalWrite(LED, OFF);       // turn LED off, too
 
   // set up serial port for diagnostics
   Serial.begin(115200);
@@ -115,19 +136,63 @@ void setup()
 
   // set up the OTA server for updates
   otaStatus = setupOTA();
+
+  // initialize the frames
+  setupFrames();
 }
 
 
 //************************************************************************
-// loop -- handle web requests and OTA requests. Note that MQTT requests
-// are handled elsewhere by the callback functions.
+// loop -- Check to see if we should open the doors (if we have the right
+// number of matching frames). Also, handle web requests and OTA requests.
+// Note that MQTT requests are handled elsewhere by the callback functions.
 //************************************************************************
 void loop(void) {
+  int numMatches = 0;           // number of matching frames we've found
+  uint32_t currentTime = millis() / 1000;   // time in seconds
+
+  // check status of each frome
+  for (int i = 0; i < numFrames; i++) {
+    // is this frame dead?
+    if (currentTime - frames[i].lastUpdateTime > 120) {
+      // haven't heard from him in 2 minutes, must be dead
+      frames[i].status = NOT_RESPONDING;
+      frames[i].detectedTag = 0;    // no false matches
+    }
+
+    // did he find the right tag?
+    else if ( (frames[i].desiredTag != 0)
+              && (frames[i].desiredTag == frames[i].detectedTag) ) {
+      // he found it!
+      frames[i].status = TAG_PRESENT;
+      numMatches++;
+    }
+
+    // else, either no match or frame is a spare
+    else {
+      frames[i].status = NO_TAG;
+    }
+  }
+
+  // should we open the doors?
+  if (numMatches >= requiredMatches) {
+    // open sesame!
+    if (!doorsOpen) openDoor();
+
+    doorsOpen = true;
+  }
+  else {
+    doorsOpen = false;
+  }
+
   // handle web requests
   server.handleClient();
 
   // check for OTA updates
   ArduinoOTA.handle();
+
+  // wait a little bit
+  delay(10);
 }
 
 
@@ -138,9 +203,9 @@ void loop(void) {
 bool setupAP()
 {
   Serial.print("Setting up AP ... ");
-  
+
   WiFi.mode(WIFI_AP);
-  
+
   // set up AP as a hidden network
   if (!WiFi.softAP(ssid, passwd, ap_channel, true)) {
     Serial.println("Failed to initialize soft AP");
@@ -193,9 +258,17 @@ bool setupMqttBroker()
 
   Serial.println("Done");
 
-  // subscribe to the two frames
-  MQTT_local_subscribe((unsigned char *) "/Frame1/status", 0);
-  MQTT_local_subscribe((unsigned char *) "/Frame2/status", 0);
+  // subscribe to the frames
+  for (int i = 1; i <= numFrames; i++) {
+    String topic("/Frame");
+    topic += i;
+    topic += "/tag";
+
+    Serial.print("Subscribing to topic ");
+    Serial.println(topic);
+
+    MQTT_local_subscribe((uint8_t *) topic.c_str(), 0);
+  }
 
   Serial.println("Waiting for messages...");
 
@@ -210,8 +283,10 @@ bool setupMqttBroker()
 bool setupWebServer()
 {
   // callbacks for status, opening the door, and reset
-  server.on("/", handleStatusRequest); 
-  server.on("/OpenDoor", handleDoor);
+  server.on("/", handleStatusRequest);
+  server.on("/OpenDoor", handleDoorCmd);
+  server.on("/ConfigRequest", handleConfigRequest);
+  server.on("/Config", handleConfig);
   server.on("/Restart", handleRestartRequest);
   server.onNotFound(handleNotFound);
 
@@ -254,20 +329,68 @@ bool setupOTA()
   return true;
 }
 
+
 //************************************************************************
-// Open or close the door locks
-// Input: openCmd = ON to open the doors, OFF to close them
+// Initialize the frame data structures.
 //************************************************************************
-void openDoor(bool openCmd)
+bool setupFrames()
 {
-  digitalWrite(DOOR1, openCmd ? ON : OFF);
-  digitalWrite(DOOR2, openCmd ? ON : OFF);
+  for (int i = 0; i < numFrames; i++) {
+    frames[i].status = NO_TAG;
+    frames[i].desiredTag = 0;
+    frames[i].detectedTag = 0;
+    frames[i].lastUpdateTime = 0;
+  }
+
+  // allocate enough EEPROM space to hold left/right frame numbers
+  EEPROM.begin(16);
+
+  // get values stored in EEPROM
+  int leftId;
+  int rightId;
+
+  EEPROM.get(0, leftId);
+  EEPROM.get(4, rightId);
+
+  Serial.print("Setup: leftId = "); Serial.println(leftId);
+  Serial.print("Setup: rightId = "); Serial.println(rightId);
+
+  // make sure they're sane
+  if ((leftId >= 0) && (leftId < numFrames)
+      && (rightId >= 0) && (rightId < numFrames)
+      && (leftId != rightId)) {
+    frames[leftId].desiredTag = tags[0];
+    frames[rightId].desiredTag = tags[1];
+  }
+
+  return true;
+}
+
+//************************************************************************
+// Open the door locks, wait a bit, and then close them
+//************************************************************************
+void openDoor()
+{
+  // fire the relays to open the doors
+  digitalWrite(DOOR1, ON);
+  digitalWrite(DOOR2, ON);
+
+  digitalWrite(LED, ON);        // turn LED on too for diagnostics
+
+  // wait a bit
+  delay(500);
+
+  // turn the relays off so we don't burn out the solenoids
+  digitalWrite(DOOR1, OFF);
+  digitalWrite(DOOR2, OFF);
+  digitalWrite(LED, OFF);
 }
 
 //************************************************************************
 // Process received messages from the frames and set the frame's status. We
-// expect the topics/data to be "/Frame1/status on" or "/Frame1/status off", and 
-// similar for Frame2.
+// expect the topics to be "/Frame1/tag", "/Frame2/tag", and so on.
+// The data will be the tag that is detected, as an 8-digit hex value (0 if
+// no tag is present).
 // Note that we also record the time that the msg was received, so that we can
 // figure out if a frame has stopped responding (i.e., the battery is dead).
 // Input:
@@ -296,20 +419,27 @@ void frameStatusCallback(uint32_t *client, const char* topic, uint32_t topicLen,
   Serial.print("Received topic: "); Serial.print(topicStr);
   Serial.print(", data: "); Serial.println(dataStr);
 
-  // process the message
-  if (topicStr == "/Frame1/status") {
-    frame1Status = (dataStr == "on") ? true : false;
-    frame1UpdateTime = millis();
-  }
+  // process the message (sanitizing the input along the way)
+  if (topicStr.startsWith("/Frame") && topicStr.endsWith("/tag")) {
+    // looks OK, so figure out frame number
+    int frameNumber = topicStr.substring(6, 7).toInt() - 1;
 
-  else if (topicStr == "/Frame2/status") {
-    frame2Status = (dataStr == "on") ? true : false;
-    frame2UpdateTime =  millis();
-  }
+    // make sure frame number is OK
+    if ((frameNumber >= 0) && (frameNumber < numFrames)) {
+      // get detected tag ID -- note: Ardunio String.toInt() doesn't seem
+      // to work correctly for big numbers. So, we'll do this by hand
+      dataStr.trim();     // trim any whitespace
+      uint32_t detectedTag = 0;
+      for (int i = 0; i < dataStr.length() && isdigit(dataStr.charAt(i)); i++) {
+        detectedTag = 10 * detectedTag + (dataStr.charAt(i) - '0');
+      }
 
-  // if both frames are on and doors are locked, then open the doors
-  openDoor(frame1Status && frame2Status && !doorStatus);
-  doorStatus = frame1Status && frame2Status;    // remember current state of door
+      frames[frameNumber].detectedTag = detectedTag;
+
+      // update time for this frame
+      frames[frameNumber].lastUpdateTime = millis() / 1000;
+    }
+  }
 }
 
 
@@ -331,49 +461,38 @@ void handleStatusRequest() {
   htmlCode += "<body>";
 
   // output system status
-  htmlCode += "<h3>System Status</h3>";
+  htmlCode += "<h3>Cabinet Status</h3>";
 
-  htmlCode += "<p>AP status: ";
-  htmlCode += (apStatus) ? "ON" : "OFF";
-  htmlCode += "</p>";
-
-  htmlCode += "<p>MDNS status: ";
-  htmlCode += (mdnsStatus) ? "ON" : "OFF";
-  htmlCode += "</p>";
-
-  htmlCode += "<p>Web Server status: ";
-  htmlCode += (webServerStatus) ? "ON" : "OFF";
-  htmlCode += "</p>";
-
-  htmlCode += "<p>MQTT status: ";
-  htmlCode += (mqttStatus) ? "ON" : "OFF";
-  htmlCode += "</p>";
-
-  htmlCode += "<p>OTA status: ";
-  htmlCode += (otaStatus) ? "ON" : "OFF";
+  // are the doors open or closed?
+  htmlCode += "<p><b>Doors:</b> ";
+  htmlCode += (doorsOpen) ? "open" : "closed";
   htmlCode += "</p>";
 
   // output frame status
-  htmlCode += "<hr>";
-  htmlCode += "<h3>Frame status:</h3>";
-  htmlCode += "<p>Frame 1: ";
-  htmlCode += (frame1Status) ? "ON " : "OFF";
-  if (currentTime - frame1UpdateTime > 20000) {
-    // frame has quit responding
-    htmlCode += " -- NOT RESPONDING";
-  }
-  htmlCode += "</p>";
+  for (int i = 0; i < numFrames; i++) {
+    htmlCode += "<p><b>Frame ";
+    htmlCode += String(i + 1);
+    htmlCode += ":</b> ";
+    if (frames[i].desiredTag == 0) htmlCode += "not in use";
+    else {
+      if (frames[i].desiredTag == tags[0]) htmlCode += "Left -- ";
+      else if (frames[i].desiredTag == tags[1]) htmlCode += "Right -- ";
 
-  htmlCode += "<p>Frame 2: ";
-  htmlCode += (frame2Status) ? "ON " : "OFF";
-  if (currentTime - frame2UpdateTime > 20000) {
-    htmlCode += " -- NOT RESPONDING";
+      if (frames[i].status == TAG_PRESENT) htmlCode += "in place";
+      else if (frames[i].status == NO_TAG) htmlCode += "not in place";
+      else if (frames[i].status == NOT_RESPONDING) htmlCode += "NOT RESPONDING";
+      else htmlCode += "unknown status";
+    }
+    htmlCode += "</p>";
   }
-  htmlCode += "</p>";
 
   // add button to open cabinet doors
   htmlCode += "<hr>";
   htmlCode += "<form action=\"/OpenDoor\" method=\"POST\"><input type=\"submit\" value=\"Open Cabinet\"></form>";
+
+  // add button to configure frames and tags
+  htmlCode += "<hr>";
+  htmlCode += "<form action=\"/ConfigRequest\" method=\"POST\"><input type=\"submit\" value=\"Configure Frames\"></form>";
 
   // add button to restart system
   htmlCode += "<hr>";
@@ -388,19 +507,149 @@ void handleStatusRequest() {
 //***********************************************************************************
 // Handle web request to open the cabinet doors
 //***********************************************************************************
-void handleDoor() {
+void handleDoorCmd() {
   // open the doors
-  openDoor(true);
-
-  // wait a bit
-  delay(1000);
-
-  // now close them again
-  openDoor(false);
+  openDoor();
 
   // send them back to the status web page
-  server.sendHeader("Location", "/");     
-  server.send(303);                       
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+
+//**********************************************************************************
+// Handle web request to configure the frames and tags
+//**********************************************************************************
+void handleConfigRequest() {
+  String htmlCode;
+
+  htmlCode += "<!DOCTYPE html>\n";
+  htmlCode += "<html>\n";
+  htmlCode += "<head>\n";
+  htmlCode += "<style>\n";
+  htmlCode += "table {\n";
+  htmlCode += "   font-family: arial, sans-serif;\n";
+  htmlCode += "   border-collapse: collapse;\n";
+  htmlCode += "   width: 100%;\n";
+  htmlCode += "}\n";
+
+  htmlCode += "td, th {\n";
+  htmlCode += "   border: 1px solid #dddddd;\n";
+  htmlCode += "   text-align: left;\n";
+  htmlCode += "   padding: 8px;\n";
+  htmlCode += "}\n";
+
+  htmlCode += "tr:nth-child(even) {\n";
+  htmlCode += "    background-color: #dddddd;\n";
+  htmlCode += "}\n";
+  htmlCode += "</style>\n";
+
+  htmlCode += "<title>Reconfigure Frames</title>\n";
+
+  htmlCode += "</head>\n";
+
+  htmlCode += "<body>\n";
+
+  htmlCode += "<h2>Select frame for each location:</h2>\n";
+
+  htmlCode += "<form action=\"/Config\">\n";
+
+  htmlCode += "<table>\n";
+  htmlCode += "  <tr>\n";
+  htmlCode += "     <th>Left</th>\n";
+  htmlCode += "     <th>Right</th>\n";
+  htmlCode += "  </tr>\n";
+
+  htmlCode += "  <tr>\n";
+  htmlCode += (frames[0].desiredTag == tags[0]) ?
+              "     <td><input type=\"radio\" name=\"left\" value=\"1\" checked> Frame 1</td>\n"
+              : "     <td><input type=\"radio\" name=\"left\" value=\"1\"> Frame 1</td>\n";
+  htmlCode += (frames[0].desiredTag == tags[1]) ?
+              "     <td><input type=\"radio\" name=\"right\" value=\"1\" checked> Frame 1</td>\n"
+              : "     <td><input type=\"radio\" name=\"right\" value=\"1\"> Frame 1</td>\n";
+  htmlCode += "  </tr>\n";
+
+  htmlCode += "  <tr>\n";
+  htmlCode += (frames[1].desiredTag == tags[0]) ?
+              "     <td><input type=\"radio\" name=\"left\" value=\"2\" checked> Frame 2</td>\n"
+              : "     <td><input type=\"radio\" name=\"left\" value=\"2\"> Frame 2</td>\n";
+  htmlCode += (frames[1].desiredTag == tags[1]) ?
+              "     <td><input type=\"radio\" name=\"right\" value=\"2\" checked> Frame 2</td>\n"
+              : "     <td><input type=\"radio\" name=\"right\" value=\"2\"> Frame 2</td>\n";
+  htmlCode += "  </tr>\n";
+
+  htmlCode += "  <tr>\n";
+  htmlCode += (frames[2].desiredTag == tags[0]) ?
+              "     <td><input type=\"radio\" name=\"left\" value=\"3\" checked> Frame 3</td>\n"
+              : "     <td><input type=\"radio\" name=\"left\" value=\"3\"> Frame 3</td>\n";
+  htmlCode += (frames[2].desiredTag == tags[1]) ?
+              "     <td><input type=\"radio\" name=\"right\" value=\"3\" checked> Frame 3</td>\n"
+              : "     <td><input type=\"radio\" name=\"right\" value=\"3\"> Frame 3</td>\n";
+  htmlCode += "  </tr>\n";
+
+  htmlCode += "</table>\n";
+
+  htmlCode += "<br>\n";
+  htmlCode += "<input type=\"submit\">\n";
+  htmlCode += "</form>\n";
+
+  htmlCode += "</body>\n";
+  htmlCode += "</html>\n";
+
+  server.send(200, "text/html", htmlCode);
+}
+
+
+//**********************************************************************************
+// Handles request to configure the frames -- specify which frame goes on the left
+// and which goes on the right.
+//**********************************************************************************
+void handleConfig()
+{
+  int leftId = -1, rightId = -1;
+
+  // get ID of left and right frames. The -1 is because received values are 1-numFrames,
+  // but array index needs to be 0 - numFrames-1.
+  if (server.hasArg("left")) {
+    leftId = server.arg("left").toInt() - 1;
+  }
+
+  if (server.hasArg("right")) {
+    rightId = server.arg("right").toInt() - 1;
+  }
+
+  // make sure they're valid
+  if ( (leftId >= 0) && (leftId < numFrames)
+       && (rightId >= 0) && (rightId < numFrames)
+       && (leftId != rightId) ) {
+    // clear the desired tags
+    for (int i = 0; i < numFrames; i++) {
+      frames[i].desiredTag = 0;
+    }
+
+    // set up the correct desired tag now
+    frames[leftId].desiredTag = tags[0];
+    frames[rightId].desiredTag = tags[1];
+
+    // store config info in eeprom
+    EEPROM.put(0, leftId);
+    EEPROM.put(4, rightId);
+    EEPROM.commit();
+
+    // send them back to main status page
+    server.sendHeader("Location", "/");
+    server.send(303);
+
+  }
+
+  else {
+    // form data is bad -- either missing entry or selected same frame twice
+    // Send them back to the configure frame page
+    server.sendHeader("Location", "/ConfigRequest");
+    server.send(303);
+
+
+  }
 }
 
 //**********************************************************************************

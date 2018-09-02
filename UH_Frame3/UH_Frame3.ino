@@ -1,4 +1,4 @@
-// For Frame 1 -- system includes ESP8266 connected to PN532 RFID sensor.
+// For Frame 3 -- system includes ESP8266 connected to PN532 RFID sensor.
 // We look every 5 seconds for an RFID tag. We connect to WiFi and
 // publish an MQTT msg whenever there's a change in the tag detection.
 // We also send a msg every minute if there's no change, just as a watchdog
@@ -28,11 +28,11 @@ extern "C" {
 #include <PN532.h>
 
 
-String clientId("Frame1");      // mqtt client name
+String clientId("Frame3");      // mqtt client name
 
 
 // OTA config
-const char OTAName[] = "UH_Jefferson_Frame1";         // A name and a password for the OTA service
+const char OTAName[] = "UH_Jefferson_Frame3";         // A name and a password for the OTA service
 const char OTAPassword[] = "";
 bool otaStatus = false;
 
