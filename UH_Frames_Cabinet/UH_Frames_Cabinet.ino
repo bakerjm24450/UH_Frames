@@ -8,6 +8,7 @@
 // Revision history:
 //  1.0 (8/7/2018) -- initial version
 //  2.0 (9/1/2018) --  revised to allow configuration -- which frame and which tag
+//  2.1 (9/11/2018) -- replaced cabinet locks with fail-safe holding magnets
 
 #include <ESP8266WiFi.h>
 #include <uMQTTBroker.h>
@@ -87,6 +88,7 @@ bool setupOTA();                          // Over The Air software updates
 bool setupFrames();                       // initialize the frame data structures
 
 void openDoor();                          // open the doors
+void lockDoor();                          // lock the doors
 
 // handle MQTT message
 void frameCallback(uint32_t *client, const char* topic, uint32_t topicLen,
@@ -113,10 +115,8 @@ void setup()
   pinMode(DOOR1, OUTPUT);
   pinMode(DOOR2, OUTPUT);
 
-  // lock the doors
-  digitalWrite(DOOR1, OFF);
-  digitalWrite(DOOR2, OFF);
-  digitalWrite(LED, OFF);       // turn LED off, too
+  // open the doors initially
+  openDoor();
 
   // set up serial port for diagnostics
   Serial.begin(115200);
@@ -177,14 +177,9 @@ void loop(void) {
   // should we open the doors?
   if (numMatches >= requiredMatches) {
     // open sesame!
-    if (!doorsOpen) openDoor();
-
-    doorsOpen = true;
+    openDoor();
   }
-  else {
-    doorsOpen = false;
-  }
-
+ 
   // handle web requests
   server.handleClient();
 
@@ -282,9 +277,9 @@ bool setupMqttBroker()
 //************************************************************************
 bool setupWebServer()
 {
-  // callbacks for status, opening the door, and reset
+  // callbacks for status, opening/locking the door, and reset
   server.on("/", handleStatusRequest);
-  server.on("/OpenDoor", handleDoorCmd);
+  server.on("/DoorCmd", handleDoorCmd);
   server.on("/ConfigRequest", handleConfigRequest);
   server.on("/Config", handleConfig);
   server.on("/Restart", handleRestartRequest);
@@ -367,23 +362,31 @@ bool setupFrames()
 }
 
 //************************************************************************
-// Open the door locks, wait a bit, and then close them
+// Open the door locks
 //************************************************************************
 void openDoor()
 {
-  // fire the relays to open the doors
+  // turn the magnets off to open the doors
+  digitalWrite(DOOR1, OFF);
+  digitalWrite(DOOR2, OFF);
+
+  digitalWrite(LED, OFF);        // turn LED off too for diagnostics
+
+  doorsOpen = true;
+}
+
+//************************************************************************
+// Lock the doors
+//************************************************************************
+void lockDoor()
+{
+  // turn the magnets on to lock the doors
   digitalWrite(DOOR1, ON);
   digitalWrite(DOOR2, ON);
 
   digitalWrite(LED, ON);        // turn LED on too for diagnostics
 
-  // wait a bit
-  delay(500);
-
-  // turn the relays off so we don't burn out the solenoids
-  digitalWrite(DOOR1, OFF);
-  digitalWrite(DOOR2, OFF);
-  digitalWrite(LED, OFF);
+  doorsOpen = false;
 }
 
 //************************************************************************
@@ -465,7 +468,7 @@ void handleStatusRequest() {
 
   // are the doors open or closed?
   htmlCode += "<p><b>Doors:</b> ";
-  htmlCode += (doorsOpen) ? "open" : "closed";
+  htmlCode += (doorsOpen) ? "open" : "locked";
   htmlCode += "</p>";
 
   // output frame status
@@ -486,10 +489,13 @@ void handleStatusRequest() {
     htmlCode += "</p>";
   }
 
-  // add button to open cabinet doors
+  // add buttons to lock and open cabinet doors
   htmlCode += "<hr>";
-  htmlCode += "<form action=\"/OpenDoor\" method=\"POST\"><input type=\"submit\" value=\"Open Cabinet\"></form>";
-
+  htmlCode += "<form>";
+  htmlCode += "<button type=\"submit\" formmethod=\"post\" formaction=\"/DoorCmd\" name = \"doorCmd\" value=\"lock\">Lock Doors</button>";
+  htmlCode += "<button type=\"submit\" formmethod=\"post\" formaction=\"/DoorCmd\" name = \"doorCmd\" value=\"open\">Open Doors</button>";
+  htmlCode += "</form>";
+  
   // add button to configure frames and tags
   htmlCode += "<hr>";
   htmlCode += "<form action=\"/ConfigRequest\" method=\"POST\"><input type=\"submit\" value=\"Configure Frames\"></form>";
@@ -505,11 +511,15 @@ void handleStatusRequest() {
 }
 
 //***********************************************************************************
-// Handle web request to open the cabinet doors
+// Handle web request to open or lock the cabinet doors
 //***********************************************************************************
 void handleDoorCmd() {
-  // open the doors
-  openDoor();
+  if (server.hasArg("doorCmd")) {
+    String cmd = server.arg("doorCmd");
+
+    if (cmd == "open") openDoor();
+    else if (cmd == "lock") lockDoor();
+  }
 
   // send them back to the status web page
   server.sendHeader("Location", "/");
